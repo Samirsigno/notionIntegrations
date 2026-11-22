@@ -6,7 +6,12 @@ from typing import Any, cast
 from notion_client import Client
 from notion_client.errors import APIResponseError
 
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
+if not NOTION_TOKEN:
+    raise RuntimeError(
+        "ERROR: El secreto NOTION_TOKEN está vacío o no está configurado en GitHub Secrets."
+    )
+
 notion = Client(auth=NOTION_TOKEN)
 
 LIMITE_CARACTERES_NOTION = 2000
@@ -180,7 +185,6 @@ def convertir_a_bloques_notion(bloques_texto: list[list[str]]) -> list[dict[str,
 
 
 def obtener_todos_los_bloques(page_id: str) -> list[dict[str, Any]]:
-    """Obtiene todos los bloques activos de la página manejando paginación y tipado."""
     bloques: list[dict[str, Any]] = []
     cursor: str | None = None
 
@@ -205,7 +209,6 @@ def obtener_todos_los_bloques(page_id: str) -> list[dict[str, Any]]:
 
 
 def borrar_bloque_seguro(block_id: str):
-    """Elimina un bloque respetando el rate limit de Notion (3 req/s) y reintentando en HTTP 429."""
     for intento in range(3):
         try:
             notion.blocks.delete(block_id=block_id)
@@ -222,3 +225,146 @@ def procesar_pagina(page_id: str):
     children = obtener_todos_los_bloques(page_id)
     lineas_extraidas: list[str] = []
     bloques_a_borrar: list[str] = []
+    contador_numerada = 1
+    bloque_ancla_anterior: str | None = None
+
+    tipos_procesables = {"paragraph", "bulleted_list_item", "numbered_list_item"}
+
+    for block in children:
+        b_type = block.get("type", "")
+        if b_type not in tipos_procesables:
+            if not bloques_a_borrar:
+                bloque_ancla_anterior = block.get("id")
+            continue
+
+        contenido_bloque = block.get(b_type)
+        if not isinstance(contenido_bloque, dict):
+            continue
+
+        rich_text = cast(list[dict[str, Any]], contenido_bloque.get("rich_text") or [])
+        texto = "".join(str(t.get("plain_text", "")) for t in rich_text)
+
+        if b_type == "numbered_list_item":
+            texto = f"{contador_numerada}. {texto}"
+            contador_numerada += 1
+        else:
+            contador_numerada = 1
+            if b_type == "bulleted_list_item":
+                texto = f"- {texto}"
+
+        lineas_extraidas.append(texto)
+        block_id = block.get("id")
+        if isinstance(block_id, str):
+            bloques_a_borrar.append(block_id)
+
+    if not any(l.strip() for l in lineas_extraidas):
+        print("  -> La página no tenía texto plano o listas para ordenar.")
+        return
+
+    nuevos_bloques = convertir_a_bloques_notion(
+        obtener_bloques_ordenados("\n".join(lineas_extraidas))
+    )
+
+    ancla_actual = bloque_ancla_anterior
+    for i in range(0, len(nuevos_bloques), 100):
+        lote = nuevos_bloques[i : i + 100]
+        append_params: dict[str, Any] = {"block_id": page_id, "children": lote}
+        if ancla_actual:
+            append_params["after"] = ancla_actual
+
+        res_append = cast(
+            dict[str, Any], notion.blocks.children.append(**append_params)
+        )
+        insertados = cast(list[dict[str, Any]], res_append.get("results") or [])
+        if insertados and isinstance(insertados[-1].get("id"), str):
+            ancla_actual = insertados[-1]["id"]
+        time.sleep(0.35)
+
+    for b_id in bloques_a_borrar:
+        borrar_bloque_seguro(b_id)
+
+
+def obtener_paginas_recientes() -> list[dict[str, Any]]:
+    """Obtiene las páginas accesibles ordenadas por última edición (evita retrasos del buscador)."""
+    paginas: list[dict[str, Any]] = []
+    cursor: str | None = None
+
+    while True:
+        params: dict[str, Any] = {
+            "filter": {"property": "object", "value": "page"},
+            "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+            "page_size": 100,
+        }
+        if cursor is not None:
+            params["start_cursor"] = cursor
+
+        respuesta = cast(dict[str, Any], notion.search(**params))
+        resultados = cast(list[dict[str, Any]], respuesta.get("results") or [])
+
+        for p in resultados:
+            if not p.get("archived") and not p.get("in_trash"):
+                paginas.append(p)
+
+        next_cursor = respuesta.get("next_cursor")
+        if not respuesta.get("has_more") or not isinstance(next_cursor, str):
+            break
+        cursor = next_cursor
+
+    return paginas
+
+
+def ejecutar_en_paginas_marcadas():
+    resultados = obtener_paginas_recientes()
+    print(f"Total de páginas accesibles por la integración: {len(resultados)}")
+
+    if len(resultados) == 0:
+        print(
+            "AVISO: La integración no tiene acceso a ninguna página. Conéctala directamente a tu Base de Datos en Notion (••• -> Connections)."
+        )
+        return
+
+    procesadas = 0
+    for pagina in resultados:
+        propiedades = pagina.get("properties")
+        if not isinstance(propiedades, dict):
+            continue
+
+        prop_titulo: str | None = None
+        titulo_actual = ""
+
+        # En bases de datos, el nombre de la columna título puede ser "Name", "Nombre", etc.
+        for prop_name, prop_val in propiedades.items():
+            if isinstance(prop_val, dict) and prop_val.get("type") == "title":
+                prop_titulo = prop_name
+                title_items = cast(list[dict[str, Any]], prop_val.get("title") or [])
+                titulo_actual = "".join(
+                    str(t.get("plain_text", "")) for t in title_items
+                )
+                break
+
+        if not prop_titulo or "[ORDENAR]" not in titulo_actual:
+            continue
+
+        page_id = pagina.get("id")
+        if not isinstance(page_id, str):
+            continue
+
+        print(f"Procesando página de BD: '{titulo_actual}' ({page_id})")
+        procesar_pagina(page_id)
+
+        nuevo_titulo = titulo_actual.replace("[ORDENAR]", "").strip()
+        notion.pages.update(
+            page_id=page_id,
+            properties={prop_titulo: {"title": [{"text": {"content": nuevo_titulo}}]}},
+        )
+        procesadas += 1
+        print(f"Completado -> Nuevo título: '{nuevo_titulo}'")
+
+    if procesadas == 0:
+        print(
+            "Se revisaron las páginas accesibles, pero ninguna tenía '[ORDENAR]' en su columna de título."
+        )
+
+
+if __name__ == "__main__":
+    ejecutar_en_paginas_marcadas()
