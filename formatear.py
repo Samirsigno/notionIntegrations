@@ -26,7 +26,9 @@ PATRON_COMANDO = re.compile(
 )
 PATRON_LISTA = re.compile(r"^(\-|\*|\d+\.)\s+")
 PATRON_INLINE_CODE = re.compile(
-    r"((?<!\w)\.git/?|\bgit\s+[a-z\-]+(?:\s+--[a-z\-]+)*|\b[a-zA-Z0-9_\-]+\.(?:txt|md|py|yml|json)\b)"
+    r"((?<!\w)\.git/?"
+    r"|\bgit\s+(?:init|status|add|commit|log|config|branch|checkout|switch|merge|pull|push|clone|diff|reset|restore|stash|tag|remote|fetch|rebase|show|rm|mv)(?:\s+--[a-z\-]+)*"
+    r"|\b[a-zA-Z0-9_\-]+\.(?:txt|md|py|yml|json)\b)"
 )
 
 
